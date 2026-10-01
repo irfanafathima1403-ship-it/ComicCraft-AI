@@ -1,0 +1,437 @@
+import os
+import io
+import re
+import json
+import textwrap
+from datetime import datetime
+
+import streamlit as st
+from PIL import Image, ImageDraw
+import google.generativeai as genai
+import requests
+from fpdf import FPDF
+
+# ---------------------------------------------------------
+# ComicCraft AI - Streamlit version
+# Based on the provided ComicCraft project specification.
+# ---------------------------------------------------------
+
+st.set_page_config(
+    page_title="ComicCraft AI",
+    page_icon="🎨",
+    layout="wide"
+)
+
+# ---------------------- CONFIG ---------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
+HF_API_KEY = os.getenv("HF_API_KEY") or st.secrets.get("HF_API_KEY", "")
+
+# The project document specifies Gemini Flash + Gemini Pro.
+# You can change these in Streamlit Secrets if your account uses
+# different/current model names.
+FLASH_MODEL = os.getenv("GEMINI_FLASH_MODEL", "gemini-1.5-flash")
+PRO_MODEL = os.getenv("GEMINI_PRO_MODEL", "gemini-1.5-pro")
+HF_MODEL = os.getenv(
+    "HF_MODEL",
+    "runwayml/stable-diffusion-v1-5"
+)
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------------------- HELPERS --------------------------
+
+def clean_json(text: str):
+    """Extract JSON even if Gemini wraps it in markdown."""
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"```$", "", text).strip()
+
+    # Try direct JSON first.
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Try to find a JSON array.
+    match = re.search(r"\[[\s\S]*\]", text)
+    if match:
+        return json.loads(match.group(0))
+
+    # Try to find a JSON object.
+    match = re.search(r"\{[\s\S]*\}", text)
+    if match:
+        return json.loads(match.group(0))
+
+    raise ValueError("Gemini did not return valid JSON.")
+
+
+def generate_outline(prompt, character, setting, tone, art_style):
+    """Generate a structured 5-panel comic outline using Gemini Flash."""
+    model = genai.GenerativeModel(FLASH_MODEL)
+
+    instruction = f"""
+Create a 5-panel comic outline.
+
+User story prompt: {prompt}
+Main character: {character}
+Setting: {setting}
+Tone: {tone}
+Art style: {art_style}
+
+Return ONLY valid JSON as an array of exactly 5 objects.
+Each object must contain:
+- panel_number
+- title
+- scene_description
+- image_prompt
+
+Do not add markdown or explanations.
+"""
+
+    response = model.generate_content(instruction)
+    data = clean_json(response.text)
+
+    if isinstance(data, dict) and "panels" in data:
+        data = data["panels"]
+
+    if not isinstance(data, list):
+        raise ValueError("Outline format is invalid.")
+
+    return data[:5]
+
+
+def generate_story(outline, character, tone):
+    """Expand the outline into narration and dialogue using Gemini Pro."""
+    model = genai.GenerativeModel(PRO_MODEL)
+
+    outline_text = json.dumps(outline, ensure_ascii=False, indent=2)
+
+    instruction = f"""
+Write the detailed story for this 5-panel comic.
+
+Main character: {character}
+Tone: {tone}
+
+Panel outline:
+{outline_text}
+
+Return ONLY valid JSON as an array of 5 objects.
+For every panel include:
+- panel_number
+- narration
+- dialogue
+- caption
+
+Keep each panel concise and suitable for a comic page.
+Do not add markdown or explanations.
+"""
+
+    response = model.generate_content(instruction)
+    data = clean_json(response.text)
+
+    if isinstance(data, dict) and "panels" in data:
+        data = data["panels"]
+
+    if not isinstance(data, list):
+        raise ValueError("Story format is invalid.")
+
+    return data[:5]
+
+
+def generate_image(prompt, panel_number):
+    """
+    Generate a comic illustration using Hugging Face Inference API.
+    If HF is unavailable, create a simple placeholder image so the
+    Streamlit demo can still run and be tested.
+    """
+    if HF_API_KEY:
+        url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+        headers = {"Authorization": f"Bearer {HF_API_KEY}"}
+
+        try:
+            response = requests.post(
+                url,
+                headers=headers,
+                json={
+                    "inputs": prompt,
+                    "parameters": {
+                        "width": 768,
+                        "height": 512
+                    }
+                },
+                timeout=120
+            )
+
+            content_type = response.headers.get("content-type", "")
+            if response.ok and "image" in content_type:
+                return Image.open(io.BytesIO(response.content)).convert("RGB")
+
+        except Exception:
+            pass
+
+    # Fallback image for demo/testing.
+    image = Image.new("RGB", (768, 512), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((15, 15, 753, 497), outline="black", width=4)
+    draw.text((35, 35), f"ComicCraft AI - Panel {panel_number}", fill="black")
+
+    wrapped = textwrap.wrap(prompt, width=65)
+    y = 100
+    for line in wrapped[:12]:
+        draw.text((35, y), line, fill="black")
+        y += 28
+
+    return image
+
+
+def build_layout(outline, story, images):
+    """Combine outline, story and generated images panel-by-panel."""
+    layout = []
+
+    for i in range(min(5, len(outline))):
+        story_item = story[i] if i < len(story) else {}
+
+        layout.append({
+            "panel_number": outline[i].get("panel_number", i + 1),
+            "title": outline[i].get("title", f"Panel {i + 1}"),
+            "scene_description": outline[i].get("scene_description", ""),
+            "image_prompt": outline[i].get("image_prompt", ""),
+            "narration": story_item.get("narration", ""),
+            "dialogue": story_item.get("dialogue", ""),
+            "caption": story_item.get("caption", ""),
+            "image": images[i]
+        })
+
+    return layout
+
+
+def safe_pdf_text(text):
+    """Make text safe for the built-in FPDF fonts."""
+    return str(text).encode("latin-1", "replace").decode("latin-1")
+
+
+def save_pdf(layout):
+    """Create a multi-page PDF containing the comic panels."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    for panel in layout:
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 18)
+        pdf.cell(
+            0,
+            12,
+            safe_pdf_text(
+                f"Panel {panel['panel_number']}: {panel['title']}"
+            ),
+            ln=True
+        )
+
+        image_bytes = io.BytesIO()
+        panel["image"].save(image_bytes, format="JPEG")
+        image_bytes.seek(0)
+
+        temp_name = f"/tmp/comiccraft_panel_{panel['panel_number']}.jpg"
+        with open(temp_name, "wb") as f:
+            f.write(image_bytes.getvalue())
+
+        pdf.image(temp_name, x=15, y=30, w=180)
+        pdf.ln(110)
+
+        pdf.set_font("Arial", "I", 11)
+        pdf.multi_cell(
+            0,
+            7,
+            safe_pdf_text(panel["scene_description"])
+        )
+
+        pdf.ln(3)
+        pdf.set_font("Arial", "", 11)
+
+        if panel["caption"]:
+            pdf.multi_cell(
+                0,
+                7,
+                safe_pdf_text("Caption: " + panel["caption"])
+            )
+
+        if panel["narration"]:
+            pdf.multi_cell(
+                0,
+                7,
+                safe_pdf_text("Narration: " + panel["narration"])
+            )
+
+        if panel["dialogue"]:
+            pdf.multi_cell(
+                0,
+                7,
+                safe_pdf_text("Dialogue: " + panel["dialogue"])
+            )
+
+    return bytes(pdf.output(dest="S"))
+
+
+# ---------------------- UI -------------------------------
+
+st.title("🎨 ComicCraft AI")
+st.subheader("AI Comic Story Creator using Gemini Models")
+
+st.write(
+    "Turn a simple story idea into a personalized 5-panel comic "
+    "with narration, dialogue, illustrations and PDF export."
+)
+
+with st.sidebar:
+    st.header("Comic Settings")
+
+    character = st.text_input(
+        "Main Character Name",
+        value="Aria"
+    )
+
+    setting = st.selectbox(
+        "Setting",
+        ["Forest", "School", "City", "Space", "Village", "Custom"]
+    )
+
+    if setting == "Custom":
+        setting = st.text_input("Enter custom setting")
+
+    tone = st.selectbox(
+        "Story Tone",
+        ["Light-hearted", "Dramatic", "Poetic", "Funny"]
+    )
+
+    art_style = st.selectbox(
+        "Art Style",
+        ["Anime", "Pixel Art", "Comic Book", "Realistic"]
+    )
+
+story_prompt = st.text_area(
+    "Story Prompt",
+    placeholder="Example: A brave fox exploring an enchanted forest.",
+    height=120
+)
+
+generate_button = st.button(
+    "✨ Generate My Comic",
+    type="primary",
+    use_container_width=True
+)
+
+if generate_button:
+    if not GEMINI_API_KEY:
+        st.error(
+            "GEMINI_API_KEY is missing. Add it to Streamlit Secrets "
+            "before generating a comic."
+        )
+        st.stop()
+
+    if not story_prompt.strip():
+        st.warning("Please enter a story prompt.")
+        st.stop()
+
+    try:
+        with st.spinner("Creating your 5-panel comic..."):
+            progress = st.progress(0)
+
+            # 1. Structured outline
+            outline = generate_outline(
+                story_prompt,
+                character,
+                setting,
+                tone,
+                art_style
+            )
+            progress.progress(25)
+
+            # 2. Narration + dialogue
+            story = generate_story(
+                outline,
+                character,
+                tone
+            )
+            progress.progress(50)
+
+            # 3. Illustrations
+            images = []
+            for i, panel in enumerate(outline):
+                image_prompt = (
+                    f"{panel.get('image_prompt', '')}. "
+                    f"Art style: {art_style}. "
+                    "Clean comic illustration, expressive characters, "
+                    "coherent visual storytelling."
+                )
+                images.append(generate_image(image_prompt, i + 1))
+                progress.progress(50 + int(((i + 1) / 5) * 35))
+
+            # 4. Layout
+            layout = build_layout(outline, story, images)
+            progress.progress(90)
+
+            # 5. PDF
+            pdf_bytes = save_pdf(layout)
+            progress.progress(100)
+
+        st.session_state["layout"] = layout
+        st.session_state["pdf"] = pdf_bytes
+        st.success("Your ComicCraft comic is ready!")
+
+    except Exception as e:
+        st.error("Comic generation failed.")
+        st.exception(e)
+
+
+# ---------------------- PREVIEW ---------------------------
+
+if "layout" in st.session_state:
+    st.divider()
+    st.header("📖 Comic Preview")
+
+    for panel in st.session_state["layout"]:
+        st.subheader(
+            f"Panel {panel['panel_number']}: {panel['title']}"
+        )
+
+        col1, col2 = st.columns([1.2, 1])
+
+        with col1:
+            st.image(panel["image"], use_container_width=True)
+
+        with col2:
+            st.markdown(
+                f"**Scene:** {panel['scene_description']}"
+            )
+
+            if panel["caption"]:
+                st.markdown(
+                    f"**Caption:** {panel['caption']}"
+                )
+
+            if panel["narration"]:
+                st.markdown(
+                    f"**Narration:** {panel['narration']}"
+                )
+
+            if panel["dialogue"]:
+                st.markdown(
+                    f"**Dialogue:** {panel['dialogue']}"
+                )
+
+            with st.expander("Image Prompt"):
+                st.write(panel["image_prompt"])
+
+        st.divider()
+
+    st.download_button(
+        label="📥 Download Your Comic as PDF",
+        data=st.session_state["pdf"],
+        file_name=f"comiccraft_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+        mime="application/pdf",
+        use_container_width=True
+    )
+
+st.caption("ComicCraft AI — Gemini-powered storytelling and comic creation.")
